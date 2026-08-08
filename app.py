@@ -60,7 +60,7 @@ st.markdown("""
 def load_data():
     """Load and clean the ferry ticketing data."""
     try:
-        df = pd.read_csv("Toronto_Island_Ferry_Tickets.csv")
+        df = pd.read_csv("Toronto Island Ferry Tickets.csv")
     except FileNotFoundError:
         st.error("Data file 'Toronto_Island_Ferry_Tickets.csv' not found. Please place it in the same directory as this app.")
         st.stop()
