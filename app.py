@@ -31,7 +31,7 @@ st.markdown("""
 # ========================== DATA LOADING ==========================
 @st.cache_data
 def load_data():
-    df = pd.read_csv("Toronto_Island_Ferry_Tickets.csv")
+    df = pd.read_csv("Toronto Island Ferry Tickets.csv")
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
     df = df.sort_values("Timestamp").drop_duplicates(subset="Timestamp")
     df = df.rename(columns={"Sales Count": "sales", "Redemption Count": "redemptions"})
