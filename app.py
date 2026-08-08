@@ -1,84 +1,49 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import pickle
-import os
-from datetime import datetime, timedelta
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from prophet import Prophet
 import warnings
 warnings.filterwarnings("ignore")
 
-# Set page config
-st.set_page_config(
-    page_title="Ferry Demand Forecasting",
-    page_icon="⛴️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Plotly import with fallback
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    USE_PLOTLY = True
+except ImportError:
+    USE_PLOTLY = False
+    import matplotlib.pyplot as plt
 
-# Custom CSS for better styling
+from datetime import datetime, timedelta
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+
+# ========================== SETUP ==========================
+st.set_page_config(page_title="Ferry Demand Forecasting", page_icon="⛴️", layout="wide")
+
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1b3a5c;
-        text-align: center;
-        margin-bottom: 0.5rem;
-    }
-    .sub-header {
-        font-size: 1.2rem;
-        color: #1f8a8c;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 10px;
-        padding: 1rem;
-        text-align: center;
-        border-left: 5px solid #1f8a8c;
-    }
-    .model-badge {
-        display: inline-block;
-        background-color: #e07a3e;
-        color: white;
-        padding: 0.2rem 0.8rem;
-        border-radius: 20px;
-        font-size: 0.8rem;
-        margin: 0.2rem;
-    }
+    .main-header { font-size: 2.5rem; color: #1b3a5c; text-align: center; margin-bottom: 0.5rem; }
+    .sub-header { font-size: 1.2rem; color: #1f8a8c; text-align: center; margin-bottom: 2rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ============================================================================
-# 1. Data Loading & Caching
-# ============================================================================
+# ========================== DATA LOADING ==========================
 @st.cache_data
 def load_data():
-    """Load and clean the ferry ticketing data."""
-    df = pd.read_csv("Toronto Island Ferry Tickets.csv")
+    df = pd.read_csv("Toronto_Island_Ferry_Tickets.csv")
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
     df = df.sort_values("Timestamp").drop_duplicates(subset="Timestamp")
     df = df.rename(columns={"Sales Count": "sales", "Redemption Count": "redemptions"})
     df = df[["Timestamp", "sales", "redemptions"]].set_index("Timestamp")
-    
-    # Reindex to 15-min grid
     full_grid = pd.date_range(df.index.min(), df.index.max(), freq="15min")
-    df_full = df.reindex(full_grid)
+    df_full = df.reindex(full_grid).fillna(0)
     df_full.index.name = "Timestamp"
-    df_full["sales"] = df_full["sales"].fillna(0)
-    df_full["redemptions"] = df_full["redemptions"].fillna(0)
     return df_full
 
 @st.cache_data
 def engineer_features(df):
-    """Create features and targets."""
     feat = df.copy()
-    # Temporal encodings
     feat["hour"] = feat.index.hour
     feat["dow"] = feat.index.dayofweek
     feat["month"] = feat.index.month
@@ -89,26 +54,18 @@ def engineer_features(df):
     feat["dow_cos"] = np.cos(2*np.pi*feat["dow"]/7)
     feat["month_sin"] = np.sin(2*np.pi*feat["month"]/12)
     feat["month_cos"] = np.cos(2*np.pi*feat["month"]/12)
-    
-    # Lags
     for lag in [1, 2, 4, 8, 96, 672]:
         feat[f"sales_lag_{lag}"] = feat["sales"].shift(lag)
         feat[f"redemptions_lag_{lag}"] = feat["redemptions"].shift(lag)
-    
-    # Rolling stats
     for window in [4, 8, 16, 96]:
         feat[f"sales_roll_mean_{window}"] = feat["sales"].shift(1).rolling(window).mean()
         feat[f"sales_roll_std_{window}"] = feat["sales"].shift(1).rolling(window).std()
         feat[f"sales_roll_max_{window}"] = feat["sales"].shift(1).rolling(window).max()
-    
-    # Multi-horizon targets
     HORIZONS = {"15min": 1, "30min": 2, "1h": 4, "2h": 8}
     for name, steps in HORIZONS.items():
         feat[f"target_sales_{name}"] = feat["sales"].shift(-steps)
-    
     return feat, HORIZONS
 
-# Feature columns used for ML models
 FEATURE_COLS = [
     "hour", "dow", "month", "is_weekend",
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos",
@@ -120,36 +77,20 @@ FEATURE_COLS = [
     "sales_roll_mean_96", "sales_roll_std_96", "sales_roll_max_96",
 ]
 
-# ============================================================================
-# 2. Model Training & Caching
-# ============================================================================
+# ========================== MODEL TRAINING ==========================
 @st.cache_resource
 def train_models():
-    """Train all ML models and return them along with test data and predictions."""
-    from sklearn.linear_model import LinearRegression
-    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-    import xgboost as xgb
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-    from prophet import Prophet
-    import logging
-    logging.getLogger("prophet").setLevel(logging.WARNING)
-    logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
-    
     df_full = load_data()
     feat, HORIZONS = engineer_features(df_full)
-    
-    # Define train/test split (last 14 days for test)
     end_ts = feat.index.max()
     test_start = end_ts - pd.Timedelta(days=14)
     train_start = test_start - pd.Timedelta(days=365)
-    
-    # Prepare dictionaries
+
     models = {}
     predictions = {}
     test_data = {}
     performance = {}
-    
-    # ML models per horizon
+
     for hname, steps in HORIZONS.items():
         target_col = f"target_sales_{hname}"
         cols_needed = FEATURE_COLS + [target_col]
@@ -157,341 +98,131 @@ def train_models():
         train, test = sub.loc[:test_start], sub.loc[test_start:]
         X_train, y_train = train[FEATURE_COLS], train[target_col]
         X_test, y_test = test[FEATURE_COLS], test[target_col]
-        
-        # Store test data for later
+
         test_data[hname] = {"X_test": X_test, "y_test": y_test, "index": test.index}
-        
-        # Train models
+
         lr = LinearRegression().fit(X_train, y_train)
         rf = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_leaf=3, n_jobs=-1, random_state=42).fit(X_train, y_train)
         gb = GradientBoostingRegressor(n_estimators=100, max_depth=3, learning_rate=0.1, subsample=0.5, random_state=42).fit(X_train, y_train)
         xgbm = xgb.XGBRegressor(n_estimators=300, max_depth=6, learning_rate=0.05, subsample=0.8,
                                 colsample_bytree=0.8, random_state=42, n_jobs=-1).fit(X_train, y_train)
-        
-        models[hname] = {
-            "Linear Regression": lr,
-            "Random Forest": rf,
-            "Gradient Boosting": gb,
-            "XGBoost": xgbm
-        }
-        
-        # Predictions for evaluation
+
+        models[hname] = {"Linear Regression": lr, "Random Forest": rf, "Gradient Boosting": gb, "XGBoost": xgbm}
+
         preds = {}
         for name, model in models[hname].items():
             y_pred = model.predict(X_test)
             preds[name] = np.clip(y_pred, 0, None)
         predictions[hname] = preds
-        
-        # Performance metrics
+
         perf = {}
         for name, y_pred in preds.items():
             mae = np.mean(np.abs(y_test - y_pred))
             rmse = np.sqrt(np.mean((y_test - y_pred)**2))
             perf[name] = {"MAE": mae, "RMSE": rmse}
         performance[hname] = perf
-    
-    # SARIMA (simplified: pre-fit on entire train set, not rolling)
-    # For demo, we'll just use a pre-defined model; but we'll implement a function to generate forecasts on the fly.
-    # We'll store a pre-fit model for quick predictions.
-    sarima_models = {}
-    sales_series = df_full["sales"].asfreq("15min").fillna(0)
-    train_series = sales_series.loc[train_start:test_start]
-    try:
-        from statsmodels.tsa.statespace.sarimax import SARIMAX
-        sarima = SARIMAX(train_series, order=(2,1,2), enforce_stationarity=False, enforce_invertibility=False)
-        sarima_fit = sarima.fit(disp=False, maxiter=50)
-        # For each horizon, we'll use the fit to forecast steps ahead
-        # We'll store the fit and the last timestamp of training
-        sarima_models["fit"] = sarima_fit
-        sarima_models["last_train_time"] = test_start
-    except Exception as e:
-        st.warning(f"SARIMA training failed: {e}")
-        sarima_models = None
-    
-    # Prophet (pre-fit on last year)
-    prophet_model = None
-    try:
-        p_train = sales_series.loc[train_start:test_start].reset_index()
-        p_train.columns = ["ds", "y"]
-        m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True,
-                    changepoint_prior_scale=0.05, interval_width=0.9)
-        m.fit(p_train)
-        prophet_model = m
-    except Exception as e:
-        st.warning(f"Prophet training failed: {e}")
-        prophet_model = None
-    
-    return models, predictions, test_data, performance, sarima_models, prophet_model, HORIZONS, train_start, test_start
 
-# ============================================================================
-# 3. Prediction Functions
-# ============================================================================
-def predict_ml(model, features_df):
-    """Predict using a trained ML model."""
-    return model.predict(features_df[FEATURE_COLS])
+    return models, predictions, test_data, performance, HORIZONS, train_start, test_start
 
-def predict_sarima(sarima_models, timestamp, horizon_steps):
-    """Generate SARIMA forecast for a given timestamp (origin) and horizon steps."""
-    if sarima_models is None:
-        return None
-    fit = sarima_models["fit"]
-    # We need to forecast from the last known data point; but for a given timestamp, we could refit.
-    # For simplicity, we'll forecast from the end of training (test_start) and shift by timestamp difference?
-    # Actually, we need to forecast for any arbitrary origin. We'll use the fit object to forecast from the end of its training data.
-    # Better: we can use the fit to forecast for steps ahead from the last known time.
-    # But if user selects a time within the test period, we can't easily use the fit because it's trained on data up to test_start.
-    # We'll implement a simplified approach: if the origin is within the test period, we can use the fit to forecast from the origin by using the `apply` method with new data? It's complex.
-    # For demo, we'll just use the pre-computed forecasts for fixed origins, or we'll only allow ML models for arbitrary timestamps.
-    # We'll return a placeholder.
-    return None
-
-def predict_prophet(prophet_model, timestamp, horizon_steps):
-    """Generate Prophet forecast for a given timestamp (only if timestamp is in future of training)."""
-    if prophet_model is None:
-        return None
-    # Prophet forecasts from the end of its training data; we can't easily forecast from arbitrary origin.
-    # For demo, we'll return None.
-    return None
-
-# ============================================================================
-# 4. Streamlit UI
-# ============================================================================
+# ========================== UI ==========================
 def main():
     st.markdown('<div class="main-header">⛴️ Ferry Demand Forecasting</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">Toronto Island Ferry Ticketing Data · 2015–2025</div>', unsafe_allow_html=True)
-    
-    # Sidebar controls
+
     st.sidebar.header("⚙️ Controls")
-    
-    # Load data and models
-    with st.spinner("Loading data and training models... (this may take a few minutes on first run)"):
-        models, predictions, test_data, performance, sarima_models, prophet_model, HORIZONS, train_start, test_start = train_models()
-    
-    # Model selection
+
+    with st.spinner("Loading data and training models (first run may take 2-3 minutes)..."):
+        models, predictions, test_data, performance, HORIZONS, train_start, test_start = train_models()
+
     model_options = ["XGBoost", "Random Forest", "Gradient Boosting", "Linear Regression"]
-    # Add SARIMA and Prophet if available
-    if sarima_models is not None:
-        model_options.append("SARIMA")
-    if prophet_model is not None:
-        model_options.append("Prophet")
-    
     selected_model = st.sidebar.selectbox("Select Model", model_options)
-    
-    # Horizon selection
+
     horizon_map = {"15min": 1, "30min": 2, "1h": 4, "2h": 8}
     horizon_names = list(horizon_map.keys())
     selected_horizon = st.sidebar.selectbox("Forecast Horizon", horizon_names)
     steps = horizon_map[selected_horizon]
-    
-    # Date/time selector
-    date_col1, date_col2 = st.sidebar.columns(2)
-    with date_col1:
-        date_input = st.date_input("Date", value=test_start.date(), min_value=test_start.date(), max_value=test_start.date() + timedelta(days=13))
-    with date_col2:
-        time_input = st.time_input("Time (15-min interval)", value=datetime.strptime("12:00", "%H:%M").time())
-    
-    # Combine to timestamp
-    selected_timestamp = pd.Timestamp(datetime.combine(date_input, time_input))
-    # Round to nearest 15-min
-    selected_timestamp = selected_timestamp.floor("15min")
-    
+
+    date_input = st.sidebar.date_input("Date", value=test_start.date(), min_value=test_start.date(), max_value=test_start.date() + timedelta(days=13))
+    time_input = st.sidebar.time_input("Time (15-min interval)", value=datetime.strptime("12:00", "%H:%M").time())
+    selected_timestamp = pd.Timestamp(datetime.combine(date_input, time_input)).floor("15min")
+
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Forecast Origin:**")
-    st.sidebar.write(selected_timestamp.strftime("%Y-%m-%d %H:%M"))
-    
-    # Fetch actual data for the selected timestamp (if in test set)
+    st.sidebar.write(f"**Forecast Origin:** {selected_timestamp.strftime('%Y-%m-%d %H:%M')}")
+
     df_full = load_data()
-    actual_value = None
-    if selected_timestamp in df_full.index:
-        actual_value = df_full.loc[selected_timestamp, "sales"]
-    
-    # Get forecast
+    actual_value = df_full.loc[selected_timestamp, "sales"] if selected_timestamp in df_full.index else None
+
+    # Predict
+    feat, _ = engineer_features(df_full)
+    row = feat.loc[selected_timestamp:selected_timestamp, FEATURE_COLS].dropna()
     forecast_value = None
-    if selected_model in ["XGBoost", "Random Forest", "Gradient Boosting", "Linear Regression"]:
-        # Use ML model
-        # Need to build features for the selected timestamp
-        feat, _ = engineer_features(df_full)
-        # Check if the timestamp has all features (i.e., not NaN)
-        row = feat.loc[selected_timestamp:selected_timestamp, FEATURE_COLS].dropna()
-        if len(row) == 0:
-            st.sidebar.warning("Insufficient history for this timestamp (need lags and rolling stats). Try a later time.")
-        else:
-            model = models[selected_horizon][selected_model]
-            pred = predict_ml(model, row)
-            forecast_value = max(0, pred[0])
-    elif selected_model == "SARIMA":
-        # Use SARIMA: we need to forecast from the selected origin.
-        # We'll implement a simple approach: refit SARIMA on history up to selected_timestamp (cached)
-        # For demo, we'll just use the pre-fit model to forecast steps ahead from the end of training.
-        # If selected_timestamp is within the test period, we can forecast from the origin by using the fit's `apply` method?
-        # We'll use a cached function to refit SARIMA on the history up to the selected timestamp.
-        @st.cache_data(show_spinner=False)
-        def get_sarima_forecast(origin, steps):
-            # This will be slow, but we'll cache.
-            try:
-                sales_series = df_full["sales"].asfreq("15min").fillna(0)
-                # Use history up to origin
-                hist = sales_series.loc[:origin]
-                if len(hist) < 100:
-                    return None
-                model = SARIMAX(hist, order=(2,1,2), enforce_stationarity=False, enforce_invertibility=False)
-                fit = model.fit(disp=False, maxiter=50)
-                fc = fit.get_forecast(steps=steps).predicted_mean
-                return fc.iloc[-1] if len(fc) > 0 else None
-            except:
-                return None
-        forecast_value = get_sarima_forecast(selected_timestamp, steps)
-    elif selected_model == "Prophet":
-        # Use Prophet: similar to SARIMA, we need to fit on history up to origin.
-        @st.cache_data(show_spinner=False)
-        def get_prophet_forecast(origin, steps):
-            try:
-                sales_series = df_full["sales"].asfreq("15min").fillna(0)
-                hist = sales_series.loc[:origin]
-                if len(hist) < 100:
-                    return None
-                df_prophet = hist.reset_index()
-                df_prophet.columns = ["ds", "y"]
-                m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True,
-                            changepoint_prior_scale=0.05)
-                m.fit(df_prophet)
-                future = m.make_future_dataframe(periods=steps, freq="15min")
-                forecast = m.predict(future)
-                return forecast["yhat"].iloc[-1] if len(forecast) > 0 else None
-            except:
-                return None
-        forecast_value = get_prophet_forecast(selected_timestamp, steps)
-    
-    # Display results
+    if len(row) > 0:
+        model = models[selected_horizon][selected_model]
+        forecast_value = max(0, model.predict(row)[0])
+    else:
+        st.sidebar.warning("Insufficient history for this timestamp. Choose a later time.")
+
+    # Metrics
     st.header("📊 Forecast Results")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("📅 Selected Time", selected_timestamp.strftime("%Y-%m-%d %H:%M"))
-    with col2:
-        st.metric("📈 Forecasted Sales", f"{forecast_value:.0f}" if forecast_value is not None else "N/A")
-    with col3:
-        if actual_value is not None:
-            st.metric("✅ Actual Sales", f"{actual_value:.0f}")
-            if forecast_value is not None:
-                error = forecast_value - actual_value
-                st.metric("Error", f"{error:+.0f}", delta=f"{error:+.0f}", delta_color="inverse")
-        else:
-            st.metric("✅ Actual Sales", "Not available (outside test period)")
-    
-    # Visualization: forecast vs actual over a recent window
-    st.subheader("📈 Forecast vs Actual (Last 7 days)")
-    # Get data for last 7 days from test period
-    end_vis = test_start + pd.Timedelta(days=13)  # end of test period
+    c1, c2, c3 = st.columns(3)
+    c1.metric("📅 Selected Time", selected_timestamp.strftime("%Y-%m-%d %H:%M"))
+    c2.metric("📈 Forecasted Sales", f"{forecast_value:.0f}" if forecast_value is not None else "N/A")
+    if actual_value is not None:
+        c3.metric("✅ Actual Sales", f"{actual_value:.0f}")
+        if forecast_value is not None:
+            error = forecast_value - actual_value
+            st.metric("Error", f"{error:+.0f}", delta=f"{error:+.0f}", delta_color="inverse")
+    else:
+        c3.metric("✅ Actual Sales", "Not available (outside test period)")
+
+    # Forecast vs Actual plot (last 7 days)
+    st.subheader("📈 Forecast vs Actual (Last 7 Days)")
+    end_vis = test_start + pd.Timedelta(days=13)
     start_vis = end_vis - pd.Timedelta(days=7)
     vis_series = df_full.loc[start_vis:end_vis]
-    # Get predictions for the selected model and horizon for the same period
-    # Use precomputed predictions for ML models (from test_data)
-    if selected_model in ["XGBoost", "Random Forest", "Gradient Boosting", "Linear Regression"]:
-        # Get predictions from precomputed
-        pred_series = predictions[selected_horizon][selected_model]
-        test_idx = test_data[selected_horizon]["index"]
-        # Align with vis_series
-        pred_df = pd.DataFrame({"pred": pred_series}, index=test_idx)
-        # Reindex to vis_series index
-        pred_aligned = pred_df.reindex(vis_series.index)
-        # Use actual from vis_series
-        actual_vis = vis_series["sales"]
-        # Create plot
+
+    pred_series = predictions[selected_horizon][selected_model]
+    test_idx = test_data[selected_horizon]["index"]
+    pred_df = pd.DataFrame({"pred": pred_series}, index=test_idx)
+    pred_aligned = pred_df.reindex(vis_series.index)
+    actual_vis = vis_series["sales"]
+
+    if USE_PLOTLY:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=actual_vis.index, y=actual_vis, mode='lines', name='Actual', line=dict(color='#1b3a5c', width=2)))
         fig.add_trace(go.Scatter(x=pred_aligned.index, y=pred_aligned["pred"], mode='lines', name=f'{selected_model} Forecast', line=dict(color='#e07a3e', width=2, dash='dash')))
-        fig.update_layout(title=f'{selected_model} - {selected_horizon} Horizon',
-                          xaxis_title='Time', yaxis_title='Sales',
-                          hovermode='x unified')
+        fig.update_layout(title=f'{selected_model} - {selected_horizon} Horizon', xaxis_title='Time', yaxis_title='Sales', hovermode='x unified')
         st.plotly_chart(fig, use_container_width=True)
-    elif selected_model == "SARIMA":
-        # For SARIMA, we could compute forecasts for each point in vis_series (slow)
-        # Instead, we'll show a placeholder or use precomputed if available.
-        st.info("SARIMA dynamic forecasts not precomputed for all timestamps. Please select a specific timestamp for forecast.")
-    elif selected_model == "Prophet":
-        # Similar
-        st.info("Prophet dynamic forecasts not precomputed for all timestamps. Please select a specific timestamp for forecast.")
     else:
-        st.info("Select a model to see forecast vs actual.")
-    
-    # Performance metrics
+        fig, ax = plt.subplots(figsize=(10,4))
+        ax.plot(actual_vis.index, actual_vis, label='Actual', color='#1b3a5c', linewidth=2)
+        ax.plot(pred_aligned.index, pred_aligned["pred"], label=f'{selected_model} Forecast', color='#e07a3e', linewidth=2, linestyle='--')
+        ax.set_title(f'{selected_model} - {selected_horizon} Horizon')
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Sales')
+        ax.legend()
+        st.pyplot(fig)
+
+    # Performance
     st.subheader("📊 Model Performance on Test Set")
-    if selected_model in ["XGBoost", "Random Forest", "Gradient Boosting", "Linear Regression"]:
-        perf = performance[selected_horizon][selected_model]
-        col1, col2 = st.columns(2)
-        col1.metric("MAE", f"{perf['MAE']:.2f}")
-        col2.metric("RMSE", f"{perf['RMSE']:.2f}")
-    elif selected_model == "SARIMA":
-        st.info("SARIMA performance metrics not precomputed.")
-    elif selected_model == "Prophet":
-        st.info("Prophet performance metrics not precomputed.")
-    
-    # Additional: confidence intervals if Prophet
-    if selected_model == "Prophet" and prophet_model is not None:
-        st.subheader("📊 Forecast with Confidence Intervals")
-        # For a selected time, we can generate uncertainty
-        # We'll show a plot for the next few hours from selected timestamp
-        st.info("Confidence interval visualization for Prophet is available for the next 2 hours from selected origin.")
-        # Generate forecast for the next 2 hours (8 steps)
-        @st.cache_data(show_spinner=False)
-        def get_prophet_forecast_with_ci(origin, steps):
-            try:
-                sales_series = df_full["sales"].asfreq("15min").fillna(0)
-                hist = sales_series.loc[:origin]
-                if len(hist) < 100:
-                    return None
-                df_prophet = hist.reset_index()
-                df_prophet.columns = ["ds", "y"]
-                m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True,
-                            changepoint_prior_scale=0.05, interval_width=0.9)
-                m.fit(df_prophet)
-                future = m.make_future_dataframe(periods=steps, freq="15min")
-                forecast = m.predict(future)
-                return forecast
-            except:
-                return None
-        forecast_df = get_prophet_forecast_with_ci(selected_timestamp, 8)
-        if forecast_df is not None:
-            # Plot forecast with CI
-            fig = go.Figure()
-            # Actual history for the same period (optional)
-            actual_hist = df_full.loc[selected_timestamp:selected_timestamp + pd.Timedelta(minutes=15*8)]
-            fig.add_trace(go.Scatter(x=actual_hist.index, y=actual_hist["sales"], mode='lines', name='Actual', line=dict(color='#1b3a5c')))
-            # Forecast
-            fig.add_trace(go.Scatter(x=forecast_df["ds"], y=forecast_df["yhat"], mode='lines', name='Forecast', line=dict(color='#e07a3e')))
-            # CI
-            fig.add_trace(go.Scatter(x=forecast_df["ds"], y=forecast_df["yhat_upper"], mode='lines', name='Upper CI', line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=forecast_df["ds"], y=forecast_df["yhat_lower"], mode='lines', name='Lower CI', line=dict(width=0), fill='tonexty', fillcolor='rgba(224,122,62,0.2)', showlegend=False))
-            fig.update_layout(title='Prophet Forecast with 90% CI',
-                              xaxis_title='Time', yaxis_title='Sales',
-                              hovermode='x unified')
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Could not generate Prophet forecast for this timestamp.")
-    
-    # Model comparison table
+    perf = performance[selected_horizon][selected_model]
+    col1, col2 = st.columns(2)
+    col1.metric("MAE", f"{perf['MAE']:.2f}")
+    col2.metric("RMSE", f"{perf['RMSE']:.2f}")
+
+    # Model comparison
     st.subheader("📊 Model Comparison (MAE by Horizon)")
-    # Build table
     comp_data = []
     for hname in horizon_names:
         for mname in model_options:
-            if mname in ["XGBoost", "Random Forest", "Gradient Boosting", "Linear Regression"]:
-                if hname in performance and mname in performance[hname]:
-                    mae = performance[hname][mname]["MAE"]
-                    comp_data.append({"Horizon": hname, "Model": mname, "MAE": mae})
-            else:
-                # SARIMA and Prophet not in performance dict
-                pass
+            if hname in performance and mname in performance[hname]:
+                comp_data.append({"Horizon": hname, "Model": mname, "MAE": performance[hname][mname]["MAE"]})
     if comp_data:
-        comp_df = pd.DataFrame(comp_data)
-        # Pivot
-        pivot = comp_df.pivot(index="Model", columns="Horizon", values="MAE")
-        st.dataframe(pivot.style.format("{:.2f}"))
-    
+        comp_df = pd.DataFrame(comp_data).pivot(index="Model", columns="Horizon", values="MAE")
+        st.dataframe(comp_df.style.format("{:.2f}"))
+
     st.sidebar.markdown("---")
-    st.sidebar.info("Data from Toronto Island Ferry Ticketing (2015-2025). Models trained on 1 year of historical data, tested on last 14 days.")
-    st.sidebar.markdown("**Note:** SARIMA and Prophet forecasts are computed on-the-fly and may take a few seconds.")
-    
+    st.sidebar.info("Data: Toronto Island Ferry (2015-2025). Models trained on 1 year, tested on last 14 days.")
+
 if __name__ == "__main__":
     main()
