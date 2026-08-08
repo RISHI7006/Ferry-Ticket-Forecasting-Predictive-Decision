@@ -11,6 +11,16 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from prophet import Prophet
 warnings.filterwarnings("ignore")
 
+# Try to import plotly; fallback to matplotlib if unavailable
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    USE_PLOTLY = True
+except ImportError:
+    USE_PLOTLY = False
+    import matplotlib.pyplot as plt
+    st.warning("Plotly not available. Using matplotlib for charts.")
+
 # Set page config
 st.set_page_config(
     page_title="Ferry Demand Forecasting",
